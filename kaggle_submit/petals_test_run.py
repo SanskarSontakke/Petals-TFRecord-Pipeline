@@ -15,7 +15,7 @@ import tensorflow as tf
 from kaggle_datasets import KaggleDatasets
 
 # --- Configuration & Constants ---
-EPOCHS = 35
+EPOCHS = 45
 IMAGE_SIZE = [512, 512]
 CLASSES = 104
 AUTOTUNE = tf.data.AUTOTUNE
@@ -56,12 +56,68 @@ def data_augment(image, label):
     image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
     return image, label
 
+def sample_beta(alpha, shape):
+    gamma1 = tf.random.gamma(shape, alpha=alpha)
+    gamma2 = tf.random.gamma(shape, alpha=alpha)
+    return gamma1 / (gamma1 + gamma2)
+
+def batch_mixup_cutmix(images, labels, alpha_mix=0.2, alpha_cut=1.0):
+    batch_size = tf.shape(images)[0]
+    
+    # 50% MixUp, 50% CutMix
+    do_mixup = tf.random.uniform([]) > 0.5
+    
+    indices = tf.random.shuffle(tf.range(batch_size))
+    images2 = tf.gather(images, indices)
+    labels2 = tf.gather(labels, indices)
+    
+    def do_mix_up():
+        lam = sample_beta(alpha_mix, [batch_size, 1, 1, 1])
+        mix_images = lam * images + (1 - lam) * images2
+        lam_l = tf.reshape(lam, [batch_size, 1])
+        mix_labels = lam_l * labels + (1 - lam_l) * labels2
+        return mix_images, mix_labels
+        
+    def do_cut_mix():
+        H = tf.shape(images)[1]
+        W = tf.shape(images)[2]
+        lam = sample_beta(alpha_cut, [batch_size])
+        
+        cut_rat = tf.math.sqrt(1.0 - lam)
+        cut_w = tf.cast(tf.cast(W, tf.float32) * cut_rat, tf.int32)
+        cut_h = tf.cast(tf.cast(H, tf.float32) * cut_rat, tf.int32)
+        
+        cx = tf.random.uniform([batch_size], minval=0, maxval=W, dtype=tf.int32)
+        cy = tf.random.uniform([batch_size], minval=0, maxval=H, dtype=tf.int32)
+        
+        bbx1 = tf.clip_by_value(cx - cut_w // 2, 0, W)
+        bby1 = tf.clip_by_value(cy - cut_h // 2, 0, H)
+        bbx2 = tf.clip_by_value(cx + cut_w // 2, 0, W)
+        bby2 = tf.clip_by_value(cy + cut_h // 2, 0, H)
+        
+        mask_w = tf.sequence_mask(bbx2, maxlen=W) ^ tf.sequence_mask(bbx1, maxlen=W)
+        mask_h = tf.sequence_mask(bby2, maxlen=H) ^ tf.sequence_mask(bby1, maxlen=H)
+        mask_w = tf.expand_dims(mask_w, 1) # [batch, 1, W]
+        mask_h = tf.expand_dims(mask_h, 2) # [batch, H, 1]
+        mask = tf.expand_dims(mask_h & mask_w, -1) # [batch, H, W, 1]
+        mask = tf.cast(mask, tf.float32)
+        
+        mix_images = images * (1 - mask) + images2 * mask
+        
+        exact_lam = 1.0 - tf.cast(cut_w * cut_h, tf.float32) / tf.cast(W * H, tf.float32)
+        lam_l = tf.reshape(exact_lam, [batch_size, 1])
+        mix_labels = lam_l * labels + (1 - lam_l) * labels2
+        return mix_images, mix_labels
+        
+    return tf.cond(do_mixup, do_mix_up, do_cut_mix)
+
 def get_training_dataset(filenames, global_batch_size):
     dataset = load_dataset(filenames, ordered=False)
     dataset = dataset.map(data_augment, num_parallel_calls=AUTOTUNE)
     dataset = dataset.repeat()
     dataset = dataset.shuffle(2048)
     dataset = dataset.batch(global_batch_size)
+    dataset = dataset.map(batch_mixup_cutmix, num_parallel_calls=AUTOTUNE)
     dataset = dataset.prefetch(AUTOTUNE)
     return dataset
 
@@ -93,19 +149,18 @@ def count_data_items(filenames):
 
 # --- Learning Rate Scheduler ---
 def lrfn(epoch, lr):
+    import math
     LR_START = 0.00001
-    LR_MAX = 0.00003 * 8 # Reduced peak LR to prevent divergence on B7
+    LR_MAX = 0.00003 * 8 # Peak LR scaled strongly by 8 TPU cores
     LR_MIN = 0.00001
     LR_RAMPUP_EPOCHS = 5
-    LR_SUSTAIN_EPOCHS = 0
-    LR_EXP_DECAY = 0.85 # Steeper decay for finer adjustments towards the end
+    EPOCH_DECAY_RESTART = 20 # Cosine Annealing restart frequency
 
     if epoch < LR_RAMPUP_EPOCHS:
         lr = (LR_MAX - LR_START) / LR_RAMPUP_EPOCHS * epoch + LR_START
-    elif epoch < LR_RAMPUP_EPOCHS + LR_SUSTAIN_EPOCHS:
-        lr = LR_MAX
     else:
-        lr = (LR_MAX - LR_MIN) * LR_EXP_DECAY**(epoch - LR_RAMPUP_EPOCHS - LR_SUSTAIN_EPOCHS) + LR_MIN
+        progress = ((epoch - LR_RAMPUP_EPOCHS) % EPOCH_DECAY_RESTART) / float(EPOCH_DECAY_RESTART)
+        lr = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1 + math.cos(math.pi * progress))
     return lr
 
 # --- Model Arch (Keras Core) ---
@@ -119,7 +174,7 @@ def build_model():
         keras.layers.Dense(CLASSES, activation='softmax', dtype='float32')
     ])
     model.compile(optimizer=keras.optimizers.Adam(),
-                  loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.10),
+                  loss=keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0, label_smoothing=0.10),
                   metrics=['categorical_accuracy'])
     return model
 
@@ -199,23 +254,43 @@ def main():
     test_images_ds = test_dataset.map(lambda image, idnum: image)
     probs1 = model.predict(test_images_ds, verbose=1)
     
-    # PASS 2: Horizontal Flip TTA
+    # PASS 2: Horizontal Flip
     print("Inference Pass 2 (Horizontal Flip)...")
-    test_images_flip_ds = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(image))
-    probs2 = model.predict(test_images_flip_ds, verbose=1)
+    test_images_ds2 = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(image))
+    probs2 = model.predict(test_images_ds2, verbose=1)
     
-    # PASS 3: Vertical Flip TTA
+    # PASS 3: Vertical Flip
     print("Inference Pass 3 (Vertical Flip)...")
-    test_images_vflip_ds = test_dataset.map(lambda image, idnum: tf.image.flip_up_down(image))
-    probs3 = model.predict(test_images_vflip_ds, verbose=1)
+    test_images_ds3 = test_dataset.map(lambda image, idnum: tf.image.flip_up_down(image))
+    probs3 = model.predict(test_images_ds3, verbose=1)
 
-    # PASS 4: Rot90 TTA
-    print("Inference Pass 4 (Rot90)...")
-    test_images_rot_ds = test_dataset.map(lambda image, idnum: tf.image.rot90(image, k=1))
-    probs4 = model.predict(test_images_rot_ds, verbose=1)
+    # PASS 4: Rot90 k=1
+    print("Inference Pass 4 (Rot90 k=1)...")
+    test_images_ds4 = test_dataset.map(lambda image, idnum: tf.image.rot90(image, k=1))
+    probs4 = model.predict(test_images_ds4, verbose=1)
+    
+    # PASS 5: Rot90 k=3
+    print("Inference Pass 5 (Rot90 k=3)...")
+    test_images_ds5 = test_dataset.map(lambda image, idnum: tf.image.rot90(image, k=3))
+    probs5 = model.predict(test_images_ds5, verbose=1)
+    
+    # PASS 6: H-Flip + V-Flip
+    print("Inference Pass 6 (H-Flip + V-Flip)...")
+    test_images_ds6 = test_dataset.map(lambda image, idnum: tf.image.flip_up_down(tf.image.flip_left_right(image)))
+    probs6 = model.predict(test_images_ds6, verbose=1)
+    
+    # PASS 7: Central Crop 80% (Zoom)
+    print("Inference Pass 7 (Central Crop 80%)...")
+    test_images_ds7 = test_dataset.map(lambda image, idnum: tf.image.resize(tf.image.central_crop(image, 0.8), IMAGE_SIZE))
+    probs7 = model.predict(test_images_ds7, verbose=1)
+    
+    # PASS 8: Central Crop + Horizontal Flip
+    print("Inference Pass 8 (Central Crop + H-Flip)...")
+    test_images_ds8 = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(tf.image.resize(tf.image.central_crop(image, 0.8), IMAGE_SIZE)))
+    probs8 = model.predict(test_images_ds8, verbose=1)
     
     # Average Probabilities
-    predictions = (probs1 + probs2 + probs3 + probs4) / 4.0
+    predictions = (probs1 + probs2 + probs3 + probs4 + probs5 + probs6 + probs7 + probs8) / 8.0
     predicted_classes = np.argmax(predictions, axis=-1)
     
     test_ids = []
