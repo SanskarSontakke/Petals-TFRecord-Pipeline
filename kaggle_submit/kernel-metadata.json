@@ -1,6 +1,6 @@
 {
   "id": "sanskarsontakke/petals-tfrecord-pipeline",
-  "title": "Petals Test Run TPU",
+  "title": "Petals TFRecord Pipeline",
   "code_file": "petals_test_run.py",
   "language": "python",
   "kernel_type": "script",
