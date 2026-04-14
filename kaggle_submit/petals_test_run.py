@@ -48,6 +48,9 @@ def load_dataset(filenames, labeled=True, ordered=False):
 
 def data_augment(image, label):
     image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_flip_up_down(image)
+    # Flower classification benefits significantly from rotational invariance
+    image = tf.image.rot90(image, k=tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32))
     image = tf.image.random_brightness(image, max_delta=0.2)
     image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
     image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
@@ -59,6 +62,18 @@ def get_training_dataset(filenames, global_batch_size):
     dataset = dataset.repeat()
     dataset = dataset.shuffle(2048)
     dataset = dataset.batch(global_batch_size)
+    dataset = dataset.prefetch(AUTOTUNE)
+    return dataset
+
+def get_validation_dataset(filenames, global_batch_size, pad_size=0):
+    dataset = load_dataset(filenames, ordered=False)
+    if pad_size > 0:
+        empty_image = tf.zeros([*IMAGE_SIZE, 3], dtype=tf.float32)
+        empty_label = tf.constant(-1, dtype=tf.int32) # Missing label for padding blocks
+        dummy_ds = tf.data.Dataset.from_tensors((empty_image, empty_label)).repeat(pad_size)
+        dataset = dataset.concatenate(dummy_ds)
+    dataset = dataset.batch(global_batch_size)
+    dataset = dataset.cache()
     dataset = dataset.prefetch(AUTOTUNE)
     return dataset
 
@@ -83,7 +98,7 @@ def lrfn(epoch, lr):
     LR_MIN = 0.00001
     LR_RAMPUP_EPOCHS = 5
     LR_SUSTAIN_EPOCHS = 0
-    LR_EXP_DECAY = 0.8 # Dynamic exponential decay curve
+    LR_EXP_DECAY = 0.9 # Recalibrated decay for smoother convergence on B7
 
     if epoch < LR_RAMPUP_EPOCHS:
         lr = (LR_MAX - LR_START) / LR_RAMPUP_EPOCHS * epoch + LR_START
@@ -104,7 +119,7 @@ def build_model():
         keras.layers.Dense(CLASSES, activation='softmax', dtype='float32')
     ])
     model.compile(optimizer=keras.optimizers.Adam(),
-                  loss='sparse_categorical_crossentropy',
+                  loss=keras.losses.SparseCategoricalCrossentropy(label_smoothing=0.05),
                   metrics=['sparse_categorical_accuracy'])
     return model
 
@@ -133,6 +148,7 @@ def main():
         
     print(f"Bypassing API... Using hardcoded diagnostic mount path: {GCS_DS_PATH}")
     TRAIN_FILENAMES = tf.io.gfile.glob(GCS_DS_PATH + '/tfrecords-jpeg-512x512/train/*.tfrec')
+    VAL_FILENAMES = tf.io.gfile.glob(GCS_DS_PATH + '/tfrecords-jpeg-512x512/val/*.tfrec')
     TEST_FILENAMES = tf.io.gfile.glob(GCS_DS_PATH + '/tfrecords-jpeg-512x512/test/*.tfrec')
 
     if not TRAIN_FILENAMES:
@@ -142,29 +158,54 @@ def main():
         return
         
     NUM_TRAINING_IMAGES = count_data_items(TRAIN_FILENAMES)
+    NUM_VALIDATION_IMAGES = count_data_items(VAL_FILENAMES)
+    
+    # Calculate padding for validation to ensure metric numbers are "real" (evaluated on 100% of images)
+    val_remainder = NUM_VALIDATION_IMAGES % GLOBAL_BATCH_SIZE
+    val_pad_size = (GLOBAL_BATCH_SIZE - val_remainder) % GLOBAL_BATCH_SIZE
+    
     STEPS_PER_EPOCH = NUM_TRAINING_IMAGES // GLOBAL_BATCH_SIZE
+    VALIDATION_STEPS = (NUM_VALIDATION_IMAGES + val_pad_size) // GLOBAL_BATCH_SIZE
     
     print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
-    print(f"Training on {NUM_TRAINING_IMAGES} Images for {EPOCHS} Epochs.")
+    print(f"Training on {NUM_TRAINING_IMAGES} Images | Validating on {NUM_VALIDATION_IMAGES} (+{val_pad_size} padding).")
+    print(f"Epochs: {EPOCHS}")
     
     train_dataset = get_training_dataset(TRAIN_FILENAMES, GLOBAL_BATCH_SIZE)
+    val_dataset = get_validation_dataset(VAL_FILENAMES, GLOBAL_BATCH_SIZE, pad_size=val_pad_size)
     model = build_model()
     lr_callback = keras.callbacks.LearningRateScheduler(lrfn, verbose=1)
     
     print("\nTraining execution transferring to JAX JIT compiler with TPU Scheduler...")
-    model.fit(train_dataset, steps_per_epoch=STEPS_PER_EPOCH, epochs=EPOCHS, callbacks=[lr_callback], verbose=1)
+    model.fit(train_dataset, 
+              steps_per_epoch=STEPS_PER_EPOCH, 
+              epochs=EPOCHS, 
+              validation_data=val_dataset,
+              validation_steps=VALIDATION_STEPS,
+              callbacks=[lr_callback], 
+              verbose=1)
     
-    print("\nRunning Inference Pipeline...")
+    print("\nRunning Inference Pipeline with 2-Pass Test Time Augmentation (TTA)...")
     NUM_TEST_IMAGES = count_data_items(TEST_FILENAMES)
     remainder = NUM_TEST_IMAGES % GLOBAL_BATCH_SIZE
     pad_size = (GLOBAL_BATCH_SIZE - remainder) % GLOBAL_BATCH_SIZE
     
-    print(f"Test Images: {NUM_TEST_IMAGES}. Padding with {pad_size} dummy elements to prevent JAX non-divisible partial batch crashes.")
+    print(f"Test Images: {NUM_TEST_IMAGES}. Padding: {pad_size}")
     
     test_dataset = get_test_dataset(TEST_FILENAMES, GLOBAL_BATCH_SIZE, pad_size=pad_size, ordered=True)
-    test_images_ds = test_dataset.map(lambda image, idnum: image)
     
-    predictions = model.predict(test_images_ds, verbose=1)
+    # PASS 1: Original Images
+    print("Inference Pass 1 (Original)...")
+    test_images_ds = test_dataset.map(lambda image, idnum: image)
+    probs1 = model.predict(test_images_ds, verbose=1)
+    
+    # PASS 2: Horizontal Flip TTA
+    print("Inference Pass 2 (Horizontal Flip TTA)...")
+    test_images_flip_ds = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(image))
+    probs2 = model.predict(test_images_flip_ds, verbose=1)
+    
+    # Average Probabilities
+    predictions = (probs1 + probs2) / 2.0
     predicted_classes = np.argmax(predictions, axis=-1)
     
     test_ids = []
@@ -177,7 +218,7 @@ def main():
 
     submission = pd.DataFrame({'id': test_ids, 'label': predicted_classes})
     submission.to_csv('submission.csv', index=False)
-    print("Generated submission.csv file natively using Kaggle TPU v5e via Keras JAX!")
+    print("SUCCESS: submission.csv generated (TTA-Enhanced) for Kaggle Petals competition!")
 
 if __name__ == "__main__":
     main()
