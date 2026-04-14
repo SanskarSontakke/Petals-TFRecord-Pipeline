@@ -30,7 +30,7 @@ def decode_image(image_data):
 def read_labeled_tfrecord(example):
     LABELED_FORMAT = {"image": tf.io.FixedLenFeature([], tf.string), "class": tf.io.FixedLenFeature([], tf.int64)}
     example = tf.io.parse_single_example(example, LABELED_FORMAT)
-    return decode_image(example['image']), tf.cast(example['class'], tf.int32)
+    return decode_image(example['image']), tf.one_hot(example['class'], CLASSES)
 
 def read_unlabeled_tfrecord(example):
     UNLABELED_FORMAT = {"image": tf.io.FixedLenFeature([], tf.string), "id": tf.io.FixedLenFeature([], tf.string)}
@@ -69,7 +69,7 @@ def get_validation_dataset(filenames, global_batch_size, pad_size=0):
     dataset = load_dataset(filenames, ordered=False)
     if pad_size > 0:
         empty_image = tf.zeros([*IMAGE_SIZE, 3], dtype=tf.float32)
-        empty_label = tf.constant(-1, dtype=tf.int32) # Missing label for padding blocks
+        empty_label = tf.zeros([CLASSES], dtype=tf.float32) # One-hot zeros for padding
         dummy_ds = tf.data.Dataset.from_tensors((empty_image, empty_label)).repeat(pad_size)
         dataset = dataset.concatenate(dummy_ds)
     dataset = dataset.batch(global_batch_size)
@@ -119,8 +119,8 @@ def build_model():
         keras.layers.Dense(CLASSES, activation='softmax', dtype='float32')
     ])
     model.compile(optimizer=keras.optimizers.Adam(),
-                  loss=keras.losses.SparseCategoricalCrossentropy(label_smoothing=0.05),
-                  metrics=['sparse_categorical_accuracy'])
+                  loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+                  metrics=['categorical_accuracy'])
     return model
 
 # --- Main Driver ---
