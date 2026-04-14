@@ -1,5 +1,5 @@
 {
-  "id": "sanskarsontakke/petals-test-run-tpu",
+  "id": "sanskarsontakke/petals-tfrecord-pipeline",
   "title": "Petals Test Run TPU",
   "code_file": "petals_test_run.py",
   "language": "python",
