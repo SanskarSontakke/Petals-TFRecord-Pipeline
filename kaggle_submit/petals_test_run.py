@@ -15,7 +15,7 @@ import tensorflow as tf
 from kaggle_datasets import KaggleDatasets
 
 # --- Configuration & Constants ---
-EPOCHS = 25
+EPOCHS = 35
 IMAGE_SIZE = [512, 512]
 CLASSES = 104
 AUTOTUNE = tf.data.AUTOTUNE
@@ -94,11 +94,11 @@ def count_data_items(filenames):
 # --- Learning Rate Scheduler ---
 def lrfn(epoch, lr):
     LR_START = 0.00001
-    LR_MAX = 0.00005 * 8 # Peak LR scaled strongly by 8 TPU cores
+    LR_MAX = 0.00003 * 8 # Reduced peak LR to prevent divergence on B7
     LR_MIN = 0.00001
     LR_RAMPUP_EPOCHS = 5
     LR_SUSTAIN_EPOCHS = 0
-    LR_EXP_DECAY = 0.9 # Recalibrated decay for smoother convergence on B7
+    LR_EXP_DECAY = 0.85 # Steeper decay for finer adjustments towards the end
 
     if epoch < LR_RAMPUP_EPOCHS:
         lr = (LR_MAX - LR_START) / LR_RAMPUP_EPOCHS * epoch + LR_START
@@ -119,7 +119,7 @@ def build_model():
         keras.layers.Dense(CLASSES, activation='softmax', dtype='float32')
     ])
     model.compile(optimizer=keras.optimizers.Adam(),
-                  loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.05),
+                  loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.10),
                   metrics=['categorical_accuracy'])
     return model
 
@@ -200,12 +200,22 @@ def main():
     probs1 = model.predict(test_images_ds, verbose=1)
     
     # PASS 2: Horizontal Flip TTA
-    print("Inference Pass 2 (Horizontal Flip TTA)...")
+    print("Inference Pass 2 (Horizontal Flip)...")
     test_images_flip_ds = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(image))
     probs2 = model.predict(test_images_flip_ds, verbose=1)
     
+    # PASS 3: Vertical Flip TTA
+    print("Inference Pass 3 (Vertical Flip)...")
+    test_images_vflip_ds = test_dataset.map(lambda image, idnum: tf.image.flip_up_down(image))
+    probs3 = model.predict(test_images_vflip_ds, verbose=1)
+
+    # PASS 4: Rot90 TTA
+    print("Inference Pass 4 (Rot90)...")
+    test_images_rot_ds = test_dataset.map(lambda image, idnum: tf.image.rot90(image, k=1))
+    probs4 = model.predict(test_images_rot_ds, verbose=1)
+    
     # Average Probabilities
-    predictions = (probs1 + probs2) / 2.0
+    predictions = (probs1 + probs2 + probs3 + probs4) / 4.0
     predicted_classes = np.argmax(predictions, axis=-1)
     
     test_ids = []
