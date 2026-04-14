@@ -1,0 +1,25 @@
+# Environment
+venv/
+petals_env/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data & Output
+*.csv
+*.h5
+*.hdf5
+*.pb
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*~

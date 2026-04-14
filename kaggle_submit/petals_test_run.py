@@ -1,0 +1,183 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+
+# --- ARCHITECTURAL PIVOT TO JAX ---
+# Kaggle's new TPU v5e-8 fleet permanently deprecated TensorFlow distributed C++ Ops natively. 
+# To harness the 8-Core TPU flawlessly, we switch the Keras 3 underlying calculation backend to JAX!
+os.environ["KERAS_BACKEND"] = "jax"
+import keras
+import jax
+
+# We still use TensorFlow strictly to parse the high-speed TFRecords Dataset pipeline
+import tensorflow as tf
+from kaggle_datasets import KaggleDatasets
+
+# --- Configuration & Constants ---
+EPOCHS = 25
+IMAGE_SIZE = [512, 512]
+CLASSES = 104
+AUTOTUNE = tf.data.AUTOTUNE
+
+# --- Data Pipeline (TensorFlow) ---
+def decode_image(image_data):
+    image = tf.image.decode_jpeg(image_data, channels=3)
+    image = tf.cast(image, tf.float32) / 255.0
+    image = tf.reshape(image, [*IMAGE_SIZE, 3])
+    return image
+
+def read_labeled_tfrecord(example):
+    LABELED_FORMAT = {"image": tf.io.FixedLenFeature([], tf.string), "class": tf.io.FixedLenFeature([], tf.int64)}
+    example = tf.io.parse_single_example(example, LABELED_FORMAT)
+    return decode_image(example['image']), tf.cast(example['class'], tf.int32)
+
+def read_unlabeled_tfrecord(example):
+    UNLABELED_FORMAT = {"image": tf.io.FixedLenFeature([], tf.string), "id": tf.io.FixedLenFeature([], tf.string)}
+    example = tf.io.parse_single_example(example, UNLABELED_FORMAT)
+    return decode_image(example['image']), example['id']
+
+def load_dataset(filenames, labeled=True, ordered=False):
+    ignore_order = tf.data.Options()
+    if not ordered: ignore_order.experimental_deterministic = False 
+    dataset = tf.data.TFRecordDataset(filenames, num_parallel_reads=AUTOTUNE)
+    dataset = dataset.with_options(ignore_order)
+    parse_fn = read_labeled_tfrecord if labeled else read_unlabeled_tfrecord
+    dataset = dataset.map(parse_fn, num_parallel_calls=AUTOTUNE)
+    return dataset
+
+def data_augment(image, label):
+    image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_brightness(image, max_delta=0.2)
+    image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
+    image = tf.image.random_saturation(image, lower=0.8, upper=1.2)
+    return image, label
+
+def get_training_dataset(filenames, global_batch_size):
+    dataset = load_dataset(filenames, ordered=False)
+    dataset = dataset.map(data_augment, num_parallel_calls=AUTOTUNE)
+    dataset = dataset.repeat()
+    dataset = dataset.shuffle(2048)
+    dataset = dataset.batch(global_batch_size)
+    dataset = dataset.prefetch(AUTOTUNE)
+    return dataset
+
+def get_test_dataset(filenames, global_batch_size, pad_size=0, ordered=True):
+    dataset = load_dataset(filenames, labeled=False, ordered=ordered)
+    if pad_size > 0:
+        empty_image = tf.zeros([*IMAGE_SIZE, 3], dtype=tf.float32)
+        empty_id = tf.constant("dummy_id", dtype=tf.string)
+        dummy_ds = tf.data.Dataset.from_tensors((empty_image, empty_id)).repeat(pad_size)
+        dataset = dataset.concatenate(dummy_ds)
+    dataset = dataset.batch(global_batch_size)
+    dataset = dataset.prefetch(AUTOTUNE)
+    return dataset
+
+def count_data_items(filenames):
+    return np.sum([int(re.compile(r"-([0-9]*)\.").search(filename).group(1)) for filename in filenames])
+
+# --- Learning Rate Scheduler ---
+def lrfn(epoch, lr):
+    LR_START = 0.00001
+    LR_MAX = 0.00005 * 8 # Peak LR scaled strongly by 8 TPU cores
+    LR_MIN = 0.00001
+    LR_RAMPUP_EPOCHS = 5
+    LR_SUSTAIN_EPOCHS = 0
+    LR_EXP_DECAY = 0.8 # Dynamic exponential decay curve
+
+    if epoch < LR_RAMPUP_EPOCHS:
+        lr = (LR_MAX - LR_START) / LR_RAMPUP_EPOCHS * epoch + LR_START
+    elif epoch < LR_RAMPUP_EPOCHS + LR_SUSTAIN_EPOCHS:
+        lr = LR_MAX
+    else:
+        lr = (LR_MAX - LR_MIN) * LR_EXP_DECAY**(epoch - LR_RAMPUP_EPOCHS - LR_SUSTAIN_EPOCHS) + LR_MIN
+    return lr
+
+# --- Model Arch (Keras Core) ---
+def build_model():
+    backbone = keras.applications.EfficientNetB7(
+        input_shape=[*IMAGE_SIZE, 3],
+        include_top=False, weights='imagenet', pooling='avg'
+    )
+    model = keras.Sequential([
+        backbone,
+        keras.layers.Dense(CLASSES, activation='softmax', dtype='float32')
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['sparse_categorical_accuracy'])
+    return model
+
+# --- Main Driver ---
+def main():
+    print(f"JAX Devices Detected: {jax.devices()}")
+    num_replicas = len(jax.devices())
+    print(f"TPU Replicas in sync: {num_replicas}")
+    BASE_BATCH_SIZE = 16
+    GLOBAL_BATCH_SIZE = BASE_BATCH_SIZE * num_replicas
+    
+    # Configure Keras to natively utilize all JAX devices (TPU Multi-Core)
+    if num_replicas > 1:
+        print("Configuring Keras DataParallel across JAX mesh...")
+        device_mesh = keras.distribution.DeviceMesh(shape=(num_replicas,), axis_names=["batch"], devices=jax.devices())
+        strategy = keras.distribution.DataParallel(device_mesh=device_mesh)
+        keras.distribution.set_distribution(strategy)
+
+    try:
+        # Ignore Kaggle's buggy GCS API lying about the missing /competitions/ folder
+        _ = KaggleDatasets().get_gcs_path('tpu-getting-started')
+    except Exception:
+        pass
+        
+    GCS_DS_PATH = "/kaggle/input/competitions/tpu-getting-started"
+        
+    print(f"Bypassing API... Using hardcoded diagnostic mount path: {GCS_DS_PATH}")
+    TRAIN_FILENAMES = tf.io.gfile.glob(GCS_DS_PATH + '/tfrecords-jpeg-512x512/train/*.tfrec')
+    TEST_FILENAMES = tf.io.gfile.glob(GCS_DS_PATH + '/tfrecords-jpeg-512x512/test/*.tfrec')
+
+    if not TRAIN_FILENAMES:
+        print("Dataset unmounted or path missing! Diagnostic footprint:")
+        for root, dirs, files in os.walk('/kaggle/input'):
+            print(f"Path: {root} | Dirs: {dirs} | File Count: {len(files)}")
+        return
+        
+    NUM_TRAINING_IMAGES = count_data_items(TRAIN_FILENAMES)
+    STEPS_PER_EPOCH = NUM_TRAINING_IMAGES // GLOBAL_BATCH_SIZE
+    
+    print(f"Global Batch Size: {GLOBAL_BATCH_SIZE}")
+    print(f"Training on {NUM_TRAINING_IMAGES} Images for {EPOCHS} Epochs.")
+    
+    train_dataset = get_training_dataset(TRAIN_FILENAMES, GLOBAL_BATCH_SIZE)
+    model = build_model()
+    lr_callback = keras.callbacks.LearningRateScheduler(lrfn, verbose=1)
+    
+    print("\nTraining execution transferring to JAX JIT compiler with TPU Scheduler...")
+    model.fit(train_dataset, steps_per_epoch=STEPS_PER_EPOCH, epochs=EPOCHS, callbacks=[lr_callback], verbose=1)
+    
+    print("\nRunning Inference Pipeline...")
+    NUM_TEST_IMAGES = count_data_items(TEST_FILENAMES)
+    remainder = NUM_TEST_IMAGES % GLOBAL_BATCH_SIZE
+    pad_size = (GLOBAL_BATCH_SIZE - remainder) % GLOBAL_BATCH_SIZE
+    
+    print(f"Test Images: {NUM_TEST_IMAGES}. Padding with {pad_size} dummy elements to prevent JAX non-divisible partial batch crashes.")
+    
+    test_dataset = get_test_dataset(TEST_FILENAMES, GLOBAL_BATCH_SIZE, pad_size=pad_size, ordered=True)
+    test_images_ds = test_dataset.map(lambda image, idnum: image)
+    
+    predictions = model.predict(test_images_ds, verbose=1)
+    predicted_classes = np.argmax(predictions, axis=-1)
+    
+    test_ids = []
+    for idnum_batch in test_dataset.map(lambda image, idnum: idnum):
+        test_ids.extend([id_val.numpy().decode('utf-8') for id_val in idnum_batch])
+
+    if pad_size > 0:
+        predicted_classes = predicted_classes[:-pad_size]
+        test_ids = test_ids[:-pad_size]
+
+    submission = pd.DataFrame({'id': test_ids, 'label': predicted_classes})
+    submission.to_csv('submission.csv', index=False)
+    print("Generated submission.csv file natively using Kaggle TPU v5e via Keras JAX!")
+
+if __name__ == "__main__":
+    main()

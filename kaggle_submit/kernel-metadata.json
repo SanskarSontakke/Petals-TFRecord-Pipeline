@@ -1,0 +1,17 @@
+{
+  "id": "sanskarsontakke/petals-test-run-tpu",
+  "title": "Petals Test Run TPU",
+  "code_file": "petals_test_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [
+    "tpu-getting-started"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}
