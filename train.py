@@ -9,7 +9,7 @@ from src.model import build_model
 from src.callbacks import get_lr_callback
 
 # Config parameters
-EPOCHS = 25
+EPOCHS = 50
 BASE_BATCH_SIZE = 16
 
 def count_data_items(filenames):
@@ -55,8 +55,8 @@ def main():
     lr_schedule = get_lr_callback(strategy, epochs=EPOCHS)
     
     early_stopping = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss',
-        patience=3, # Will stop if validation loss doesn't improve for 3 entire epochs
+        monitor='val_sparse_categorical_accuracy',
+        patience=10, 
         restore_best_weights=True,
         verbose=1
     )
