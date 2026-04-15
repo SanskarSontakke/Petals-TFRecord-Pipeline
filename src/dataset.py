@@ -7,10 +7,12 @@ CLASSES = 104
 
 def decode_image(image_data):
     """
-    Decodes the raw JPEG bytestring, normalizes to [0, 1], and properly reshapes.
+    Decodes the raw JPEG bytestring and properly reshapes.
+    The / 255.0 normalization is removed as Keras backbones 
+    handles this internally via built-in Rescaling layers.
     """
     image = tf.image.decode_jpeg(image_data, channels=3)
-    image = tf.cast(image, tf.float32) / 255.0
+    image = tf.cast(image, tf.float32)
     
     # Explicit shape is required for TPUs since they cannot dynamically reshape effectively.
     image = tf.reshape(image, [*IMAGE_SIZE, 3])

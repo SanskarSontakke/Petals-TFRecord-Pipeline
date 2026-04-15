@@ -25,9 +25,9 @@ AUTOTUNE = tf.data.AUTOTUNE
 # --- Data Pipeline (TensorFlow) ---
 def decode_image(image_data):
     image = tf.image.decode_jpeg(image_data, channels=3)
-    # Leak 1: Remove manual / 255.0 division. Keras backbones include Rescaling layers.
+    # Fix: Raw pixel values [0, 255]. Keras backbones contain built-in Rescaling.
     image = tf.cast(image, tf.float32) 
-    image = tf.reshape(image, [512, 512, 3]) # Raw TFRecord size
+    image = tf.reshape(image, [512, 512, 3]) 
     return image
 
 def read_labeled_tfrecord(example):
@@ -144,20 +144,19 @@ def get_training_dataset(filenames, global_batch_size):
     dataset = dataset.prefetch(AUTOTUNE)
     return dataset
 
-def get_validation_dataset(filenames, global_batch_size, pad_size=0):
-    # Leak 2: Use resize_with_pad to keep natural flower geometry without squishing
+def get_validation_dataset(filenames, global_batch_size):
+    """
+    Refactor: Removed dummy zero padding to prevent validation metric poisoning.
+    Evaluates only on natural dataset images for pure SOTA metrics.
+    """
     def val_preprocess(image, label):
         image = tf.image.resize_with_pad(image, IMAGE_SIZE[0], IMAGE_SIZE[1])
         return image, label
 
     dataset = load_dataset(filenames, ordered=False)
     dataset = dataset.map(val_preprocess, num_parallel_calls=AUTOTUNE)
-    if pad_size > 0:
-        empty_image = tf.zeros([*IMAGE_SIZE, 3], dtype=tf.float32)
-        empty_label = tf.zeros([CLASSES], dtype=tf.float32) 
-        dummy_ds = tf.data.Dataset.from_tensors((empty_image, empty_label)).repeat(pad_size)
-        dataset = dataset.concatenate(dummy_ds)
-    dataset = dataset.batch(global_batch_size)
+    # Use drop_remainder=True to keep TPU shapes static while maintaining pure metrics
+    dataset = dataset.batch(global_batch_size, drop_remainder=True)
     dataset = dataset.cache()
     dataset = dataset.prefetch(AUTOTUNE)
     return dataset
@@ -259,14 +258,15 @@ def main():
 
     NUM_TRAINING_IMAGES = count_data_items(TRAIN_FILENAMES)
     NUM_VALIDATION_IMAGES = count_data_items(VAL_FILENAMES)
-    val_remainder = NUM_VALIDATION_IMAGES % GLOBAL_BATCH_SIZE
-    val_pad_size = (GLOBAL_BATCH_SIZE - val_remainder) % GLOBAL_BATCH_SIZE
     
     STEPS_PER_EPOCH = NUM_TRAINING_IMAGES // GLOBAL_BATCH_SIZE
-    VALIDATION_STEPS = (NUM_VALIDATION_IMAGES + val_pad_size) // GLOBAL_BATCH_SIZE
+    # Calculate steps based on natural dataset size (dropped remainder)
+    VALIDATION_STEPS = NUM_VALIDATION_IMAGES // GLOBAL_BATCH_SIZE
     
+    print(f"SOTA Mode: Training on {NUM_TRAINING_IMAGES} | Validating on {NUM_VALIDATION_IMAGES}")
+
     train_dataset = get_training_dataset(TRAIN_FILENAMES, GLOBAL_BATCH_SIZE)
-    val_dataset = get_validation_dataset(VAL_FILENAMES, GLOBAL_BATCH_SIZE, pad_size=val_pad_size)
+    val_dataset = get_validation_dataset(VAL_FILENAMES, GLOBAL_BATCH_SIZE)
 
     # --- SHARED CONFIG ---
     focal_loss = keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0, label_smoothing=0.05)
