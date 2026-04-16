@@ -18,8 +18,7 @@ keras.mixed_precision.set_global_policy("mixed_bfloat16")
 
 IMAGE_SIZE = [600, 600]
 EPOCHS = 50 
-BATCH_SIZE_A = 64 # EfficientNetB7 Batch
-BATCH_SIZE_B = 8  # EfficientNetV2-L Batch (Ultra-Safe)
+GLOBAL_BATCH_SIZE = 64 # (8 per core)
 LR_MAX = 0.00024
 LR_MIN = 0.000005
 LR_RAMPUP_EPOCHS = 6
@@ -36,7 +35,7 @@ def decode_image(image_data):
     # Fix 1: Reshape to source resolution (512x512) for TPU static shape compliance,
     # then resize to target IMAGE_SIZE (600x600) to ensure core elements match.
     image = tf.reshape(image, [512, 512, 3]) 
-    image = tf.image.resize(image, IMAGE_SIZE)
+    image = tf.image.resize(image, IMAGE_SIZE) # Resize to 600px Base
     return image
 
 def read_labeled_tfrecord(example):
@@ -221,36 +220,33 @@ def get_checkpoint_callback(model_id):
         verbose=2
     )
 
-def run_inference_and_submit(model_a, model_b=None, blend=(1.0, 0.0), test_filenames=None, pad_size=0, batch_size=32):
+def run_inference_and_submit(model_a, test_filenames, pad_size=0, batch_size=32):
     """
     Helper to run 4-pass Biologically Accurate TTA and generate submission.csv
+    Using Model A (EfficientNetB7) Only.
     """
-    print(f"\nRunning TTA Inference (Blend A={blend[0]} | B={blend[1]})...")
+    print("\nRunning TTA Inference (EfficientNetB7 Only)...")
     test_dataset = get_test_dataset(test_filenames, batch_size, pad_size=pad_size, ordered=True)
     
-    def predict_weighted(ds):
-        probs_a = model_a.predict(ds, verbose=0)
-        if model_b is not None:
-            probs_b = model_b.predict(ds, verbose=0)
-            return blend[0] * probs_a + blend[1] * probs_b
-        return probs_a
+    def predict(ds):
+        return model_a.predict(ds, verbose=0)
 
     # PASS 1: Original
     print("Pass 1: Original...")
     ds = test_dataset.map(lambda image, idnum: image)
-    probs1 = predict_weighted(ds)
+    probs1 = predict(ds)
     # PASS 2: H-Flip
     print("Pass 2: Horizontal Flip...")
     ds = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(image))
-    probs2 = predict_weighted(ds)
+    probs2 = predict(ds)
     # PASS 3: Crop
     print("Pass 3: Central Crop...")
     ds = test_dataset.map(lambda image, idnum: tf.image.resize(tf.image.central_crop(image, 0.9), IMAGE_SIZE))
-    probs3 = predict_weighted(ds)
+    probs3 = predict(ds)
     # PASS 4: Crop + H-Flip
     print("Pass 4: Crop + H-Flip...")
     ds = test_dataset.map(lambda image, idnum: tf.image.flip_left_right(tf.image.resize(tf.image.central_crop(image, 0.9), IMAGE_SIZE)))
-    probs4 = predict_weighted(ds)
+    probs4 = predict(ds)
     
     predictions = (probs1 + probs2 + probs3 + probs4) / 4.0
     predicted_classes = np.argmax(predictions, axis=-1)
@@ -268,26 +264,15 @@ def run_inference_and_submit(model_a, model_b=None, blend=(1.0, 0.0), test_filen
     print("Log: submission.csv generated.")
 
 # --- Model Arch ---
-def build_model(model_type="B7"):
+def build_model():
     """
-    Kaggle Grandmaster Refinement: Returns both model and the backbone reference
-    to support 2-Stage Staged Fine-Tuning.
+    SOTA EfficientNetB7 Backbone at 600x600 resolution.
     """
     inputs = keras.Input(shape=[*IMAGE_SIZE, 3])
-    
-    if model_type == "B7":
-        backbone = keras.applications.EfficientNetB7(
-            input_shape=[*IMAGE_SIZE, 3],
-            include_top=False, weights='imagenet', pooling='avg'
-        )
-    elif model_type == "V2L":
-        backbone = keras.applications.EfficientNetV2L(
-            input_shape=[*IMAGE_SIZE, 3],
-            include_top=False, weights='imagenet', pooling='avg'
-        )
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-        
+    backbone = keras.applications.EfficientNetB7(
+        input_shape=[*IMAGE_SIZE, 3],
+        include_top=False, weights='imagenet', pooling='avg'
+    )
     x = backbone(inputs)
     outputs = keras.layers.Dense(CLASSES, activation='softmax', dtype='float32')(x)
     model = keras.Model(inputs=inputs, outputs=outputs)
@@ -351,94 +336,47 @@ def main():
     focal_loss = keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0, label_smoothing=0.05)
     early_stopping = keras.callbacks.EarlyStopping(monitor='val_categorical_accuracy', patience=12, restore_best_weights=True, verbose=1)
 
-    # --- [PHASE 1] EfficientNetB7 ---
+    # --- [PHASE 1] EfficientNetB7 Training ---
     print("\n[PHASE 1] Training EfficientNetB7 Staged Pipeline...")
-    STEPS_PER_EPOCH = NUM_TRAINING_IMAGES // BATCH_SIZE_A
-    val_padded_remainder = NUM_VALIDATION_IMAGES % BATCH_SIZE_A
-    val_padding = (BATCH_SIZE_A - val_padded_remainder) % BATCH_SIZE_A
-    VALIDATION_STEPS = (NUM_VALIDATION_IMAGES + val_padding) // BATCH_SIZE_A
+    STEPS_PER_EPOCH = NUM_TRAINING_IMAGES // GLOBAL_BATCH_SIZE
+    val_padded_remainder = NUM_VALIDATION_IMAGES % GLOBAL_BATCH_SIZE
+    val_padding = (GLOBAL_BATCH_SIZE - val_padded_remainder) % GLOBAL_BATCH_SIZE
+    VALIDATION_STEPS = (NUM_VALIDATION_IMAGES + val_padding) // GLOBAL_BATCH_SIZE
     
-    train_dataset = get_training_dataset(TRAIN_FILENAMES, BATCH_SIZE_A)
-    val_dataset = get_validation_dataset(VAL_FILENAMES, BATCH_SIZE_A)
+    train_dataset = get_training_dataset(TRAIN_FILENAMES, GLOBAL_BATCH_SIZE)
+    val_dataset = get_validation_dataset(VAL_FILENAMES, GLOBAL_BATCH_SIZE)
     
     with distribution.scope():
-        model_a = build_model("B7")
+        model = build_model()
 
-    print(f"Stage 1/2: Warming up classification head (Batch: {BATCH_SIZE_A})...")
-    model_a.layers[1].trainable = False
-    model_a.compile(optimizer=keras.optimizers.Adam(1e-3), loss=focal_loss, metrics=['categorical_accuracy'])
-    model_a.fit(train_dataset, steps_per_epoch=STEPS_PER_EPOCH, epochs=3, verbose=2)
+    print(f"Stage 1/2: Warming up classification head (Batch: {GLOBAL_BATCH_SIZE})...")
+    model.layers[1].trainable = False
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss=focal_loss, metrics=['categorical_accuracy'])
+    model.fit(train_dataset, steps_per_epoch=STEPS_PER_EPOCH, epochs=3, verbose=2)
     
     print("Stage 2/2: Fine-tuning full backbone...")
-    model_a.layers[1].trainable = True
-    model_a.compile(optimizer=keras.optimizers.Adam(), loss=focal_loss, metrics=['categorical_accuracy'])
-    lr_callback = get_lr_callback(phase_scale=1.0) # Full scale for Batch 64
-    model_a.fit(
+    model.layers[1].trainable = True
+    model.compile(optimizer=keras.optimizers.Adam(), loss=focal_loss, metrics=['categorical_accuracy'])
+    lr_callback = get_lr_callback(phase_scale=1.0)
+    model.fit(
         train_dataset, 
         steps_per_epoch=STEPS_PER_EPOCH,
         epochs=EPOCHS - 3,
         validation_data=val_dataset,
         validation_steps=VALIDATION_STEPS,
-        callbacks=[lr_callback, early_stopping, get_checkpoint_callback("A")],
+        callbacks=[lr_callback, early_stopping, get_checkpoint_callback("B7")],
         verbose=2
     )
     
-    # --- Intermediary Safety Submission ---
-    print("\nPhase 1 Complete. Generating Safety Submission (Model A Only)...")
-    # Load best weights before purging
-    model_a.load_weights("best_model_A.keras")
+    # --- Final Inference ---
+    print("\nGeneration Final Submission using Best B7 Weights...")
+    model.load_weights("best_model_B7.keras")
     
     NUM_TEST_IMAGES = count_data_items(TEST_FILENAMES)
     pad_size_32 = (32 - (NUM_TEST_IMAGES % 32)) % 32
-    run_inference_and_submit(model_a, None, (1.0, 0.0), TEST_FILENAMES, pad_size_32, 32)
+    run_inference_and_submit(model, TEST_FILENAMES, pad_size_32, 32)
     
-    print("Purging Model A from TPU HBM...")
-    del model_a
-    keras.backend.clear_session()
-    gc.collect()
-
-    # --- [PHASE 2] EfficientNetV2-L ---
-    print("\n[PHASE 2] Training EfficientNetV2-L Staged Pipeline...")
-    STEPS_PER_EPOCH = NUM_TRAINING_IMAGES // BATCH_SIZE_B
-    val_padded_remainder = NUM_VALIDATION_IMAGES % BATCH_SIZE_B
-    val_padding = (BATCH_SIZE_B - val_padded_remainder) % BATCH_SIZE_B
-    VALIDATION_STEPS = (NUM_VALIDATION_IMAGES + val_padding) // BATCH_SIZE_B
-    
-    train_dataset = get_training_dataset(TRAIN_FILENAMES, BATCH_SIZE_B)
-    val_dataset = get_validation_dataset(VAL_FILENAMES, BATCH_SIZE_B)
-    
-    with distribution.scope():
-        model_b = build_model("V2L")
-
-    print(f"Stage 1/2: Warming up classification head (Batch: {BATCH_SIZE_B})...")
-    model_b.layers[1].trainable = False
-    model_b.compile(optimizer=keras.optimizers.Adam(1e-3), loss=focal_loss, metrics=['categorical_accuracy'])
-    model_b.fit(train_dataset, steps_per_epoch=STEPS_PER_EPOCH, epochs=3, verbose=2)
-    
-    print("Stage 2/2: Fine-tuning full backbone...")
-    model_b.layers[1].trainable = True
-    model_b.compile(optimizer=keras.optimizers.Adam(), loss=focal_loss, metrics=['categorical_accuracy'])
-    # Ultra-Safe Scaling: 8/64 = 0.125x LR for Batch 8
-    lr_callback = get_lr_callback(phase_scale=0.125) 
-    model_b.fit(
-        train_dataset, 
-        steps_per_epoch=STEPS_PER_EPOCH,
-        epochs=EPOCHS - 3,
-        validation_data=val_dataset,
-        validation_steps=VALIDATION_STEPS,
-        callbacks=[lr_callback, early_stopping, get_checkpoint_callback("B")],
-        verbose=2
-    )
-
-    # --- [PHASE 3] Final Ensemble Overwrite ---
-    print("\n[PHASE 3] Generating Final Weighted Ensemble Submission...")
-    with distribution.scope():
-        model_a = build_model("B7")
-        model_a.load_weights("best_model_A.keras")
-        model_b = build_model("V2L")
-        model_b.load_weights("best_model_B.keras")
-
-    run_inference_and_submit(model_a, model_b, (0.6, 0.4), TEST_FILENAMES, pad_size_32, 32)
+    print("\nSUCCESS: submission.csv generated (EfficientNetB7 single-model pipeline).")
 
 if __name__ == "__main__":
     main()
